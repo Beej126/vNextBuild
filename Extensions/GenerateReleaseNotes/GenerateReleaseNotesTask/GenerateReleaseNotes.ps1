@@ -158,8 +158,15 @@ function Get-BuildIDsRelease
     )
 
 	# get the build IDs
-    $buildIds = $release.artifacts.definitionReference.version.id
-	$buildIds
+    #it seems VSTS release will only ever be associated to single build (true?)
+    #but then we lose visibility of all the work items and changesets that occurred in any other builds leading to that release
+    #new approach - return all the buildIds between that release and this release
+    $thisReleaseBuildId = $release.artifacts.definitionReference.version.id
+
+    $previousRelease = Get-Release -tfsUri $tfsUri -teamproject $teamproject -releaseid ($release.id - 1) -usedefaultcreds $usedefaultcreds
+    $previousReleaseBuildId = $previousRelease.artifacts.definitionReference.version.id
+
+	return $([int]$previousReleaseBuildId + 1)..$thisReleaseBuildId
 }
 
 function Indent-Space
@@ -185,22 +192,33 @@ function Invoke-GetCommand
      $usedefaultcreds
     )
 
-    $webclient = new-object System.Net.WebClient
-    $webclient.Encoding = [System.Text.Encoding]::UTF8
+    if (-not $script:webclient) {
+        $script:webclient = new-object System.Net.WebClient
+        $script:webclient.Encoding = [System.Text.Encoding]::UTF8
 	
-    if ([System.Convert]::ToBoolean($usedefaultcreds) -eq $true)
-    {
-        Write-Verbose "Using default credentials"
-        $webclient.UseDefaultCredentials = $true
-    } else {
-        Write-Verbose "Using SystemVssConnection personal access token"
-        $vssEndPoint = Get-ServiceEndPoint -Name "SystemVssConnection" -Context $distributedTaskContext
-        $personalAccessToken = $vssEndpoint.Authorization.Parameters.AccessToken
-        $webclient.Headers.Add("Authorization" ,"Bearer $personalAccessToken")
+        if ([System.Convert]::ToBoolean($usedefaultcreds) -eq $true)
+        {
+            Write-Verbose "Using default credentials"
+            $script:webclient.UseDefaultCredentials = $true
+        } else {
+            if ($env:VSTS_PAT) {
+              Write-Verbose "Using TEST mode personal access token in: `$env:VSTS_PAT"
+              Add-Type -AssemblyName System
+              #from: https://www.visualstudio.com/en-us/docs/integrate/get-started/auth/overview
+              $script:webclient.Headers["Authorization"] = "Basic $([System.Convert]::ToBase64String( [System.Text.Encoding]::UTF8.GetBytes("username:$env:VSTS_PAT") ))"
+            }
+            else {
+              Write-Verbose "Using SystemVssConnection personal access token"
+              $vssEndPoint = Get-ServiceEndPoint -Name "SystemVssConnection" -Context $distributedTaskContext
+              $personalAccessToken = $vssEndpoint.Authorization.Parameters.AccessToken
+              $script:webclient.Headers["Authorization"] = "Bearer $personalAccessToken"
+            }
+        
+        }
     }
     
-	#write-verbose "REST Call [$uri]"
-    $webclient.DownloadString($uri)
+	write-verbose "REST Call [$uri]"
+    $script:webclient.DownloadString($uri)
 }
 
 
@@ -225,7 +243,7 @@ function Get-Template
 	
 	Write-Verbose "Using template mode [$templateLocation]"
 
-	if ($templateLocation -eq 'File')
+	if ($templateLocation -eq 'File' -or $templatefile)
 	{
     	write-Verbose "Loading template file [$templatefile]"
 		$template = Get-Content $templatefile
@@ -399,7 +417,7 @@ function Process-Template
                 (($modeStack.Peek().mode -eq [Mode]::CS) -and ($csdetail -eq $null)))
             {
                 # there is no data to expand
-                $out += "None"
+                #$out += "None`n"
             } else {
                	# nothing to expand just process the line
 				$out += $line | render
@@ -426,6 +444,10 @@ param
 
  	write-verbose "Getting build details for BuildID [$buildid]"    
  	$build = Get-Build -tfsUri $collectionUrl -teamproject $teamproject -buildid $buildid -usedefaultcreds $usedefaultcreds
+    if ($build.result -ne "succeeded") {
+      Write-Verbose "build [$($buildid)] failed, skipping"
+      return
+    }
 
     Write-Verbose "Getting associated work items for build [$($buildid)]"
 	Write-Verbose "Getting associated changesets/commits for build [$($buildid)]"
@@ -464,11 +486,13 @@ Write-Verbose "releaseid = [$env:RELEASE_RELEASEID]"
 Write-Verbose "buildid = [$env:BUILD_BUILDID]"
 Write-Verbose "defname = [$env:BUILD_DEFINITIONNAME]"
 Write-Verbose "buildnumber = [$env:BUILD_BUILDNUMBER]"
+Write-Verbose "personalAccessToken = [$personalAccessToken]"
 
+Write-Verbose "output file = [$outputfile]"
+Write-Verbose "=============================="
 
 if ( [string]::IsNullOrEmpty($releaseid))
 {
-    
    Write-Verbose "In Build mode"
    $builds = Get-BuildDataSet -tfsUri $collectionUrl -teamproject $teamproject -buildid $buildid -usedefaultcreds $usedefaultcreds
     
